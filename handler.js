@@ -496,27 +496,65 @@ const handleMessage = async (sock, msg) => {
     if (!content || actualMessageTypes.length === 0) return;
     
     // Slow mode check (applies to all group messages with content)
-    if (isGroup && !msg.key.fromMe) {
-      try {
-        const groupSettings = database.getGroupSettings(from);
-        if (groupSettings.slowmode) {
-          const senderIsOwner = isOwner(sender);
-          const senderIsGroupOwner = groupMetadata && findParticipant(groupMetadata.participants || [], sender)?.admin === 'superadmin';
-          if (!senderIsOwner && !senderIsGroupOwner) {
-            const cooldownMs = (groupSettings.slowmodeCooldown || 30) * 1000;
-            const result = checkSlowMode(from, sender, cooldownMs);
-            if (result.onCooldown) {
-              await sock.sendMessage(from, {
-                text: `⏳ *Slow mode is active.*\nPlease wait *${result.remainingSecs}* more second${result.remainingSecs === 1 ? '' : 's'} before sending another message.`
-              }, { quoted: msg });
-              return;
-            }
+   if (isGroup && !msg.key.fromMe) {
+  try {
+    const groupSettings = database.getGroupSettings(from);
+    if (groupSettings.slowmode) {
+      // Only exempt owner and bot owner
+      const senderIsGroupOwner = groupMetadata?.owner && (groupMetadata.owner === sender);
+      const senderIsBotOwner = isOwner(sender);
+      if (!senderIsGroupOwner && !senderIsBotOwner) {
+        const cooldownMs = (groupSettings.slowmodeCooldown || 30) * 1000;
+        const result = checkSlowMode(from, sender, cooldownMs);
+        if (result.onCooldown) {
+          // 1. Delete student message (slowmode violation)
+          try {
+            await sock.sendMessage(from, {
+              delete: {
+                remoteJid: from,
+                fromMe: false,
+                id: msg.key.id,
+                participant: sender
+              }
+            });
+          } catch (e) {
+            console.error('Failed to delete slowmode violation message:', e);
           }
+
+          // 2. Send warning message
+          let warnMsg;
+          try {
+            warnMsg = await sock.sendMessage(from, {
+              text: `⏳ *Slow mode is active.*\nPlease wait *${result.remainingSecs}* more seconds before sending another message.`
+            }, { quoted: msg });
+          } catch (e) {}
+
+          // 3. Auto-delete warning after 3 seconds
+          if (warnMsg && warnMsg.key && warnMsg.key.id) {
+            setTimeout(async () => {
+              try {
+                await sock.sendMessage(from, {
+                  delete: {
+                    remoteJid: from,
+                    fromMe: true,
+                    id: warnMsg.key.id,
+                  }
+                });
+              } catch (e) {}
+            }, 3000);
+          }
+
+          // 4. OPTIONAL: Try to also delete "this message was deleted" banner if possible (WhatsApp API restriction)
+          // Not always possible.
+
+          return;
         }
-      } catch (e) {
-        console.error('Error in slow mode check:', e);
       }
     }
+  } catch (e) {
+    console.error('Error in slow mode check:', e);
+  }
+}
     
     // 🔹 Button response should also check unwrapped content
     const btn = content.buttonsResponseMessage || msg.message?.buttonsResponseMessage;
