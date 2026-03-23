@@ -501,9 +501,10 @@ const handleMessage = async (sock, msg) => {
     const groupSettings = database.getGroupSettings(from);
     if (groupSettings.slowmode) {
       // Only exempt owner and bot owner
-      const senderIsGroupOwner = groupMetadata?.owner && (groupMetadata.owner === sender);
-      const senderIsBotOwner = isOwner(sender);
-      if (!senderIsGroupOwner && !senderIsBotOwner) {
+     const senderIsGroupOwner = groupMetadata?.owner && (groupMetadata.owner === sender);
+const senderIsBotOwner = isOwner(sender);
+const senderIsAdmin = await isAdmin(sock, sender, from, groupMetadata);
+if (!senderIsGroupOwner && !senderIsBotOwner && !senderIsAdmin) {
         const cooldownMs = (groupSettings.slowmodeCooldown || 30) * 1000;
         const result = checkSlowMode(from, sender, cooldownMs);
         if (result.onCooldown) {
@@ -541,7 +542,7 @@ const handleMessage = async (sock, msg) => {
                   }
                 });
               } catch (e) {}
-            }, 3000);
+            }, 5000);
           }
 
           // 4. OPTIONAL: Try to also delete "this message was deleted" banner if possible (WhatsApp API restriction)
