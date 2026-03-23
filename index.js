@@ -238,7 +238,12 @@ async function startBot() {
     markOnlineOnConnect: false,
     getMessage: async () => undefined // Don't load messages from store
   });
-
+  generateHighQualityLinkPreview: false,
+  patchMessageBeforeSending: (msg) => msg,
+  transactionOpts: { maxCommitRetries: 1, delayBetweenTriesMs: 10 },
+  connectTimeoutMs: 20000,
+  keepAliveIntervalMs: 30000,
+});
   // Bind store to socket
   store.bind(sock.ev);
 
