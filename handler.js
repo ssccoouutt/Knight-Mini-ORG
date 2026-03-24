@@ -6,6 +6,7 @@ const config = require('./config');
 const database = require('./database');
 const { loadCommands } = require('./utils/commandLoader');
 const { addMessage } = require('./utils/groupstats');
+const { checkSlowMode } = require('./utils/slowMode');
 const { jidDecode, jidEncode } = require('@whiskeysockets/baileys');
 const fs = require('fs');
 const path = require('path');
@@ -13,7 +14,39 @@ const axios = require('axios');
 
 // Group metadata cache to prevent rate limiting
 const groupMetadataCache = new Map();
-const CACHE_TTL = 60000; // 1 minute cache
+const CACHE_TTL = 30000; // 1 minute cache
+const CACHE_MAX_SIZE = 50; // Maximum number of cached groups
+
+// Evict the entry with the oldest timestamp when at capacity
+const evictOldestCacheEntry = () => {
+  let oldestKey = null;
+  let oldestTime = Infinity;
+  for (const [k, v] of groupMetadataCache.entries()) {
+    if (v.timestamp < oldestTime) {
+      oldestTime = v.timestamp;
+      oldestKey = k;
+    }
+  }
+  if (oldestKey) groupMetadataCache.delete(oldestKey);
+};
+
+// Helper to write to cache while enforcing TTL and size limits
+const setCacheEntry = (groupId, data) => {
+  if (groupMetadataCache.size >= CACHE_MAX_SIZE) {
+    evictOldestCacheEntry();
+  }
+  groupMetadataCache.set(groupId, { data, timestamp: Date.now() });
+};
+
+// Periodically evict expired entries so the Map doesn't grow unboundedly
+const _groupMetadataCacheCleanupInterval = setInterval(() => {
+  const now = Date.now();
+  for (const [key, value] of groupMetadataCache.entries()) {
+    if (now - value.timestamp > CACHE_TTL) {
+      groupMetadataCache.delete(key);
+    }
+  }
+}, 90 * 1000); // Every 90 seconds (TTL is 60s; this keeps expired entries for at most ~150s)
 
 // Load all commands
 const commands = loadCommands();
@@ -51,11 +84,8 @@ const getCachedGroupMetadata = async (sock, groupId) => {
     // Fetch from API
     const metadata = await sock.groupMetadata(groupId);
     
-    // Cache it
-    groupMetadataCache.set(groupId, {
-      data: metadata,
-      timestamp: Date.now()
-    });
+    // Cache it (enforce hard cap to prevent unbounded growth)
+    setCacheEntry(groupId, metadata);
     
     return metadata;
   } catch (error) {
@@ -68,10 +98,7 @@ const getCachedGroupMetadata = async (sock, groupId) => {
       error.data === 403
     )) {
       // Cache null for forbidden groups to prevent repeated attempts
-      groupMetadataCache.set(groupId, {
-        data: null,
-        timestamp: Date.now()
-      });
+      setCacheEntry(groupId, null);
       return null; // Silently return null for forbidden groups
     }
     
@@ -102,10 +129,7 @@ const getLiveGroupMetadata = async (sock, groupId) => {
     const metadata = await sock.groupMetadata(groupId);
     
     // Update cache for other features (antilink, welcome, etc.)
-    groupMetadataCache.set(groupId, {
-      data: metadata,
-      timestamp: Date.now()
-    });
+    setCacheEntry(groupId, metadata);
     
     return metadata;
   } catch (error) {
@@ -144,7 +168,11 @@ const isMod = (sender) => {
 
 // LID mapping cache
 const lidMappingCache = new Map();
-
+setInterval(() => {
+  if (lidMappingCache.size > 100) {
+    lidMappingCache.clear();
+  }
+}, 60 * 1000);
 // Helper to normalize JID to just the number part
 const normalizeJid = (jid) => {
   if (!jid) return null;
@@ -471,6 +499,68 @@ const handleMessage = async (sock, msg) => {
     // Return early for non-group messages with no recognizable content
     if (!content || actualMessageTypes.length === 0) return;
     
+    // Slow mode check (applies to all group messages with content)
+   if (isGroup && !msg.key.fromMe) {
+  try {
+    const groupSettings = database.getGroupSettings(from);
+    if (groupSettings.slowmode) {
+      // Only exempt owner and bot owner
+     const senderIsGroupOwner = groupMetadata?.owner && (groupMetadata.owner === sender);
+ const senderIsBotOwner = isOwner(sender);
+ const senderIsAdmin = await isAdmin(sock, sender, from, groupMetadata);
+ if (!senderIsGroupOwner && !senderIsBotOwner && !senderIsAdmin) {
+        const cooldownMs = (groupSettings.slowmodeCooldown || 30) * 1000;
+        const result = checkSlowMode(from, sender, cooldownMs);
+        if (result.onCooldown) {
+          // 1. Delete student message (slowmode violation)
+          try {
+            await sock.sendMessage(from, {
+              delete: {
+                remoteJid: from,
+                fromMe: false,
+                id: msg.key.id,
+                participant: sender
+              }
+            });
+          } catch (e) {
+            console.error('Failed to delete slowmode violation message:', e);
+          }
+
+          // 2. Send warning message
+          let warnMsg;
+          try {
+            warnMsg = await sock.sendMessage(from, {
+              text: `⏳ *Slow mode is active.*\nPlease wait *${result.remainingSecs}* more seconds before sending another message.`
+            }, { quoted: msg });
+          } catch (e) {}
+
+          // 3. Auto-delete warning after 3 seconds
+          if (warnMsg && warnMsg.key && warnMsg.key.id) {
+            setTimeout(async () => {
+              try {
+                await sock.sendMessage(from, {
+                  delete: {
+                    remoteJid: from,
+                    fromMe: true,
+                    id: warnMsg.key.id,
+                  }
+                });
+              } catch (e) {}
+            }, 50000);
+          }
+
+          // 4. OPTIONAL: Try to also delete "this message was deleted" banner if possible (WhatsApp API restriction)
+          // Not always possible.
+
+          return;
+        }
+      }
+    }
+  } catch (e) {
+    console.error('Error in slow mode check:', e);
+  }
+}
+    
     // 🔹 Button response should also check unwrapped content
     const btn = content.buttonsResponseMessage || msg.message?.buttonsResponseMessage;
     if (btn) {
@@ -534,7 +624,20 @@ const handleMessage = async (sock, msg) => {
         return;
       }
     }
-    
+
+    // Handle list response (interactive list selections)
+    const list = content.listResponseMessage || msg.message?.listResponseMessage;
+    if (list) {
+      const selectedRowId = list?.singleSelectReply?.selectedRowId || list?.selectedRowId;
+      if (selectedRowId && String(selectedRowId).startsWith('quiz_')) {
+        const quizCmd = commands.get('quiz');
+        if (quizCmd && typeof quizCmd.handleSelection === 'function') {
+          await quizCmd.handleSelection(sock, msg, selectedRowId);
+          return; // handled by quiz module
+        }
+      }
+    }
+
     // Get message body from unwrapped content
     let body = '';
     if (content.conversation) {
@@ -906,7 +1009,6 @@ const handleGroupUpdate = async (sock, update) => {
             phoneJid = participantInfo.phoneNumber;
           } else {
             // Try to normalize participantJid to phoneNumber format
-            // If it's a LID, try to convert to phoneNumber
             try {
               const normalized = normalizeJidWithLid(participantJid);
               if (normalized && normalized.includes('@s.whatsapp.net')) {
@@ -963,15 +1065,6 @@ const handleGroupUpdate = async (sock, update) => {
             }
           }
           
-          // Get user's profile picture URL
-          let profilePicUrl = '';
-          try {
-            profilePicUrl = await sock.profilePictureUrl(participantJid, 'image');
-          } catch (ppError) {
-            // If profile picture not available, use default avatar
-            profilePicUrl = 'https://img.pyrocdn.com/dbKUgahg.png';
-          }
-          
           // Get group name and description
           const groupName = groupMetadata.subject || 'the group';
           const groupDesc = groupMetadata.desc || 'No description';
@@ -984,25 +1077,15 @@ const handleGroupUpdate = async (sock, update) => {
             hour12: true 
           });
           
-          // Create formatted welcome message
+          // Send text-only welcome message (no image download to save memory)
           const welcomeMsg = `╭╼━≪•𝙽𝙴𝚆 𝙼𝙴𝙼𝙱𝙴𝚁•≫━╾╮\n┃𝚆𝙴𝙻𝙲𝙾𝙼𝙴: @${displayName} 👋\n┃Member count: #${groupMetadata.participants.length}\n┃𝚃𝙸𝙼𝙴: ${timeString}⏰\n╰━━━━━━━━━━━━━━━╯\n\n*@${displayName}* Welcome to *${groupName}*! 🎉\n*Group 𝙳𝙴𝚂𝙲𝚁𝙸𝙿𝚃𝙸𝙾𝙽*\n${groupDesc}\n\n> *ᴘᴏᴡᴇʀᴇᴅ ʙʏ ${config.botName}*`;
           
-          // Construct API URL for welcome image
-          const apiUrl = `https://api.some-random-api.com/welcome/img/7/gaming4?type=join&textcolor=white&username=${encodeURIComponent(displayName)}&guildName=${encodeURIComponent(groupName)}&memberCount=${groupMetadata.participants.length}&avatar=${encodeURIComponent(profilePicUrl)}`;
-          
-          // Download the welcome image
-          const imageResponse = await axios.get(apiUrl, { responseType: 'arraybuffer' });
-          const imageBuffer = Buffer.from(imageResponse.data);
-          
-          // Send the welcome image with formatted caption
           await sock.sendMessage(id, { 
-            image: imageBuffer,
-            caption: welcomeMsg,
+            text: welcomeMsg,
             mentions: [participantJid] 
           });
         } catch (welcomeError) {
-          // Fallback to text message if image generation fails
-          console.error('Welcome image error:', welcomeError);
+          // Fallback to simple text message
           let message = groupSettings.welcomeMessage || 'Welcome @user to @group! 👋\nEnjoy your stay!';
           message = message.replace('@user', `@${participantNumber}`);
           message = message.replace('@group', groupMetadata.subject || 'the group');
@@ -1089,46 +1172,15 @@ const handleGroupUpdate = async (sock, update) => {
             }
           }
           
-          // Get user's profile picture URL
-          let profilePicUrl = '';
-          try {
-            profilePicUrl = await sock.profilePictureUrl(participantJid, 'image');
-          } catch (ppError) {
-            // If profile picture not available, use default avatar
-            profilePicUrl = 'https://img.pyrocdn.com/dbKUgahg.png';
-          }
-          
-          // Get group name and description
-          const groupName = groupMetadata.subject || 'the group';
-          const groupDesc = groupMetadata.desc || 'No description';
-          
-          // Get current time string
-          const now = new Date();
-          const timeString = now.toLocaleTimeString('en-US', { 
-            hour: '2-digit', 
-            minute: '2-digit',
-            hour12: true 
-          });
-          
-          // Create simple goodbye message
+          // Send text-only goodbye message (no image download to save memory)
           const goodbyeMsg = `Goodbye @${displayName} 👋 We will never miss you!`;
           
-          // Construct API URL for goodbye image (using leave type)
-          const apiUrl = `https://api.some-random-api.com/welcome/img/7/gaming4?type=leave&textcolor=white&username=${encodeURIComponent(displayName)}&guildName=${encodeURIComponent(groupName)}&memberCount=${groupMetadata.participants.length}&avatar=${encodeURIComponent(profilePicUrl)}`;
-          
-          // Download the goodbye image
-          const imageResponse = await axios.get(apiUrl, { responseType: 'arraybuffer' });
-          const imageBuffer = Buffer.from(imageResponse.data);
-          
-          // Send the goodbye image with caption
           await sock.sendMessage(id, { 
-            image: imageBuffer,
-            caption: goodbyeMsg,
+            text: goodbyeMsg,
             mentions: [participantJid] 
           });
         } catch (goodbyeError) {
           // Fallback to simple goodbye message
-          console.error('Goodbye error:', goodbyeError);
           const goodbyeMsg = `Goodbye @${participantNumber} 👋 We will never miss you! 💀`;
           
           await sock.sendMessage(id, { 
@@ -1248,16 +1300,16 @@ const handleAntigroupmention = async (sock, msg, groupMetadata) => {
       
       // Check for forwarded newsletter info in various message types
       isForwardedStatus = isForwardedStatus || 
-        (msg.message.extendedTextMessage && msg.message.extendedTextMessage.contextInfo && 
+        (msg.message.extendedTextMessage && msg.message.extendedTextMessage.contextInfo &&
          msg.message.extendedTextMessage.contextInfo.forwardedNewsletterMessageInfo);
       isForwardedStatus = isForwardedStatus || 
-        (msg.message.conversation && msg.message.contextInfo && 
+        (msg.message.conversation && msg.message.contextInfo &&
          msg.message.contextInfo.forwardedNewsletterMessageInfo);
       isForwardedStatus = isForwardedStatus || 
-        (msg.message.imageMessage && msg.message.imageMessage.contextInfo && 
+        (msg.message.imageMessage && msg.message.imageMessage.contextInfo &&
          msg.message.imageMessage.contextInfo.forwardedNewsletterMessageInfo);
       isForwardedStatus = isForwardedStatus || 
-        (msg.message.videoMessage && msg.message.videoMessage.contextInfo && 
+        (msg.message.videoMessage && msg.message.videoMessage.contextInfo &&
          msg.message.videoMessage.contextInfo.forwardedNewsletterMessageInfo);
       isForwardedStatus = isForwardedStatus || 
         (msg.message.contextInfo && msg.message.contextInfo.forwardedNewsletterMessageInfo);
@@ -1280,30 +1332,6 @@ const handleAntigroupmention = async (sock, msg, groupMetadata) => {
     }
     
     // Additional debug logging for detection
-    if (groupSettings.antigroupmention) {
-      // Debug log removed
-    }
-    
-    // Additional debug logging to help identify message structure
-    if (groupSettings.antigroupmention) {
-      // Debug log removed
-      // Debug log removed
-      if (msg.message) {
-        // Debug log removed
-        // Log specific message types that might indicate a forwarded status
-        if (msg.message.protocolMessage) {
-          // Debug log removed
-        }
-        if (msg.message.contextInfo) {
-          // Debug log removed
-        }
-        if (msg.message.extendedTextMessage && msg.message.extendedTextMessage.contextInfo) {
-          // Debug log removed
-        }
-      }
-    }
-    
-    // Debug logging for detection
     if (groupSettings.antigroupmention) {
       // Debug log removed
     }

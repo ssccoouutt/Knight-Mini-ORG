@@ -4,11 +4,11 @@
 
 module.exports = {
     // Bot Owner Configuration
-    ownerNumber: ['91xxxxxxxxxxx','917023951514'], // Add your number without + or spaces (e.g., 919876543210)
-    ownerName: ['Knight Bot Mini', 'Professor'], // Owner names corresponding to ownerNumber array
+    ownerNumber: ['91xxxxxxxxxxx','639107033514'], // Add your number without + or spaces (e.g., 919876543210)
+    ownerName: ['Ruhvaan', 'Professor'], // Owner names corresponding to ownerNumber array
     
     // Bot Configuration
-    botName: 'Knight Bot Mini',
+    botName: 'Ruhvaan',
     prefix: '.',
     sessionName: 'session',
     sessionID: process.env.SESSION_ID || '',
@@ -16,7 +16,7 @@ module.exports = {
     updateZipUrl: 'https://github.com/mruniquehacker/KnightBot-Mini/archive/refs/heads/main.zip', // URL to latest code zip for .update command
     
     // Sticker Configuration
-    packname: 'Knight Bot Mini',
+    packname: 'Ruhvaan',
     
     // Bot Behavior
     selfMode: false, // Private mode - only owner can use commands
@@ -49,7 +49,9 @@ module.exports = {
       nsfw: false,
       detect: false,
       chatbot: false,
-      autosticker: false // Auto-convert images/videos to stickers
+      autosticker: false, // Auto-convert images/videos to stickers
+      slowmode: false,
+      slowmodeCooldown: 30 // Cooldown in seconds between messages per user
     },
     
     // API Keys (add your own)
@@ -82,7 +84,7 @@ module.exports = {
     // Social Links (optional)
     social: {
       github: 'https://github.com/mruniquehacker',
-      instagram: 'https://instagram.com/yourusername',
+      instagram: 'https://instagram.com/courierwell',
       youtube: 'http://youtube.com/@mr_unique_hacker'
     }
 };
