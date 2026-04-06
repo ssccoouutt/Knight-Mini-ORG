@@ -53,13 +53,17 @@ console.warn = (...args) => {
 
 // Now safe to load libraries
 const pino = require('pino');
+
+// FIX: Baileys v7+ ESM compatibility - load via .default
+const baileys = require('@whiskeysockets/baileys').default;
 const {
-  default: makeWASocket,
+  makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
   Browsers,
   fetchLatestBaileysVersion
-} = require('@whiskeysockets/baileys');
+} = baileys;
+
 const qrcode = require('qrcode-terminal');
 const config = require('./config');
 const handler = require('./handler');
