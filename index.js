@@ -54,7 +54,8 @@ console.warn = (...args) => {
 // Now safe to load libraries
 const pino = require('pino');
 
-// FIX: Baileys v7+ ESM compatibility - load via .default
+// ========== FIX FOR BAILEYS v7+ ==========
+// Load Baileys ESM module correctly in CommonJS
 const baileys = require('@whiskeysockets/baileys').default;
 const {
   makeWASocket,
@@ -63,6 +64,7 @@ const {
   Browsers,
   fetchLatestBaileysVersion
 } = baileys;
+// =========================================
 
 const qrcode = require('qrcode-terminal');
 const config = require('./config');
@@ -180,7 +182,7 @@ const createSuppressedLogger = (level = 'silent') => {
   // Wrap log methods to filter
   const originalInfo = logger.info.bind(logger);
   logger.info = (...args) => {
-    const msg = args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ').toLowerCase();
+    const msg = args.map(a => typeof a === 'string' ? a : typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ').toLowerCase();
     if (!forbiddenPatterns.some(pattern => msg.includes(pattern))) {
       originalInfo(...args);
     }
